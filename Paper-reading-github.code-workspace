@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"name": "Paper-reading-github",
+			"path": "."
+		},
+		{
+			"name": "scGen",
+			"path": "../scGen"
+		},
+		{
+			"name": "scVI",
+			"path": "../scVI"
+		}
+	],
+	"settings": {}
+}

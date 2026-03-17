@@ -1,0 +1,134 @@
+# scVI: Single-Cell Transcriptomics Deep Generative Model Explained
+
+## 1. Introduction
+
+scVI (single-cell Variational Inference), by Lopez et al. (Nat Methods 2018) [1], is a deep generative model for scRNA-seq.
+
+### 1.1 Core scRNA-seq Challenges
+1. **Limited Sensitivity**: Low capture/sequencing depth → many zeros (true biological zeros + technical dropouts).
+2. **Batch Effects**: Systematic differences across experiments.
+3. **Overdispersion**: Variance > mean; Poisson underestimates.
+
+### 1.2 Limitations of Prior Methods
+- Linear assumptions fail for nonlinear cell relations.
+- Separate tools for tasks (PCA dimred, Louvain cluster, ComBat batch correct, DESeq2 DE) → inconsistent.
+- Poor scalability (>few 10k cells).
+
+### 1.3 What scVI Does
+Encodes each cell's expression into:
+- **10D vector z**: Biological state (type, differentiation).
+- **1D scalar l**: Library size.
+
+Models per-gene expression as **Zero-Inflated Negative Binomial (ZINB)**, params from NN based on z, l, batch s.
+
+Unified for: dimred, clustering, batch correction, DE, imputation.
+
+### 1.4 Scalability
+Stochastic optimization (mini-batches of 128); handles 1M cells in ~1hr on GPU (vs others failing at 50k on 32GB RAM).
+
+## 2. From VAE to scVI
+
+Builds on VAE (Kingma 2013) [2]: encoder → q(z|x) prob dist → sample z → decoder → p(x|z).
+
+Key adaptations for scRNA-seq:
+
+| Feature | Original VAE | scVI |
+|---------|--------------|------|
+| Data Assumption | Gaussian/Bernoulli | **ZINB** for zeros/overdispersion |
+| Noise Handling | Implicit | Explicit l (lib size), s (batch) |
+| Generative | p(x\|z) | p(x\|z,l,s) |
+| Loss | MSE/CE | **ZINB log-likelihood** |
+
+## 3. Full Model Overview
+
+**Data Flow (paper Fig.1a)**:
+```
+Inputs: x_n (raw counts), s_n (batch)
+
+Variational q(z_n, l_n | x_n, s_n) [NN1-4]
+  x,s -> NN1/3: μ_l/μ_z    NN2/4: σ_l/σ_z
+  l_n ~ LogNormal(μ_l, σ_l²)
+  z_n ~ Normal(μ_z, σ_z²)
+
+Generative p(x_n | z_n, l_n, s_n) [NN5-6]
+  z,s -> NN5: ρ_n (freq)   NN6: π_n (dropout)
+  μ_n = l_n * ρ_n
+  ZINB(μ_n, θ_g, π_n) -> x_n
+```
+
+### 3.1 Generative Process
+1. z_n ~ N(0,I)  // bio latent
+2. l_n ~ LogNormal(empirical μ/σ)  // lib size
+3. ρ_ng = f_w(z_n, s_n)  // softmax freqs
+4. w_ng ~ Gamma(ρ_ng, θ_g)
+5. y_ng ~ Poisson(l_n * w_ng)  // NB equiv
+6. h_ng ~ Bernoulli(f_h(z_n, s_n))
+7. x_ng = 0 if h=1 else y_ng  // ZINB
+
+### 3.2 Encoder (q posterior)
+Two NNs:
+- z_encoder: x+s → μ_z, σ_z (1-3 layers, 128/256 hidden, ReLU+BN+dropout) → N(μ_z, diag(σ_z²))
+- l_encoder: x+s → μ_l, σ_l (1 layer) → LogNormal
+
+Reparam: z = μ_z + σ_z * ε (ε~N(0,I))
+
+### 3.3 Decoder (p generative)
+- f_w (NN5): z+s → ρ_n (softmax)
+- f_h (NN6): z+s → π_n (sigmoid)
+- ZINB params: μ_ng = l_n * ρ_ng, θ_g (per-gene/batch/cell), π_ng
+
+Dispersion modes: "gene" (default), "gene-batch", "gene-cell".
+
+### 3.4 Dual Latents
+- **z (10D)**: Bio state prior N(0,I); for downstream.
+- **l (1D)**: Lib factor; use_observed_lib_size=True/False.
+
+Separates bio/tech variance; joint norm w/ analysis.
+
+## 4. Loss: ELBO
+Max log p(x) ≈ ELBO:
+
+L = E_q[log p(x|z,l,s)] - KL(q(z|x,s)||p(z)) - KL(q(l|x)||p(l))
+
+- Recon: -ZINB.log_prob(x).sum(-1)
+- KL_z: standard
+- KL_l: LogNormal vs empirical prior
+
+Code snippet (_vae.py):
+```python
+kl_z = kl(qz, pz).sum(-1)
+if not use_observed_lib_size: kl_l = kl(ql, pl).sum(1)
+reconst = -px.log_prob(x).sum(-1)
+loss = mean(reconst + kl_weight*kl_z + kl_l)
+```
+
+## 5. Data Prep & Input
+- Raw UMI counts (no norm/log!).
+- Filter cells (QC: UMI/genes/mt %).
+- HVGs: sc.pp.highly_variable_genes or poisson_gene_selection (~2-7k genes).
+- AnnData.obs['batch_key'] required.
+
+Flow:
+```
+Raw → QC → HVG → AnnData → setup_anndata(batch_key) → SCVI → train → obsm['X_scVI']
+```
+
+## 6. Training
+- Adam optimizer, LR~1e-3, batch=128-512.
+- Epochs: 200-400 + early stopping (val ELBO).
+- GPU-friendly stochastic opt.
+
+## 7. Results
+- **Fig1**: Linear time to 1M cells.
+- **Fig2**: Preserves bio structure (Cortex types, Hemato trajectory), superior batch mixing (Retina vs ComBat/MNN).
+- **Fig3**: Top DE accuracy (AUROC/IDR vs bulk gold std; NoLib ablation fails).
+
+## 8. Key Impacts
+Unified probabilistic framework; explicit tech correction; ZINB modeling; nonlinear/scalable.
+
+**One-liner**: scVI learns bio latents z + lib l from raw counts via conditional VAE+ZINB, enabling joint norm/denoising/analysis.
+
+## References
+[1] Lopez et al. (2018) Nat Methods. [link]
+[2] Kingma & Welling (2013) arXiv. [link]
+[3] scvi-tools docs. [link]

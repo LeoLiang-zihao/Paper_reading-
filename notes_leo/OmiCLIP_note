@@ -1,0 +1,57 @@
+# OmiCLIP / Loki Quick Note
+
+## Core Idea
+- OmiCLIP learns a shared embedding space for H&E image patches and omics-derived text.
+- Training supervision comes from paired spatial transcriptomics data: each image patch is paired with a spot-level gene profile from the same location.
+- Spot omics are converted to text by ranking highly expressed genes and concatenating them into a gene sentence.
+
+## Data Representation
+- Raw ST format: `spot x gene` matrix plus spot coordinates.
+- scRNA format: `cell x gene` matrix, typically without direct one-to-one pairing to spots/patches.
+- Model-side representation:
+  - Image patch -> `z_img` (768-d embedding)
+  - Gene sentence -> `z_txt` (768-d embedding)
+
+## Loki Modules (Input -> Output)
+
+### 1) Loki Align
+- Input: source and target slices (ST and/or image), each with coordinates + embeddings.
+- Output: aligned source coordinates (and transformed source image).
+- Method: CPD-based non-rigid registration in embedding-guided space.
+- Note: target means reference coordinate frame, not a class label.
+
+### 2) Loki Annotate (bulk RNA-seq mode)
+- Input: image patch embeddings + bulk RNA-derived text embeddings per tissue type.
+- Output: similarity heatmaps / tissue labels for patches.
+- Method: zero-shot similarity matching.
+
+### 3) Loki Annotate (marker gene mode)
+- Input: image patch embeddings + marker-gene sentence embeddings.
+- Output: patch-level tissue class by max similarity.
+- Method: zero-shot classification without bulk data.
+
+### 4) Loki Decompose
+- Input: scRNA reference (with cell-type labels) + query embeddings (ST spots or image patches).
+- Output: cell-type proportion per spot/patch.
+- Method: Tangram-style optimization in embedding space.
+- Key point: there is no direct scRNA-to-spot pair supervision. This is a decomposition/mapping optimization, not one-to-one supervised alignment.
+
+### 5) Loki Retrieve
+- Input: query image embedding + transcriptomic embedding database.
+- Output: top-K most similar transcriptomic entries.
+- Method: cross-modal nearest-neighbor retrieval by similarity ranking.
+
+### 6) Loki PredEx
+- Input: query image embedding + reference ST spots (embeddings + known expression).
+- Output: predicted gene expression for each query patch/spot.
+- Method: similarity-weighted averaging (interpolation-like prediction).
+
+## What Is Actually Trained vs Optimized
+- Trained globally: OmiCLIP encoders (contrastive learning on paired image-ST data).
+- Task-time optimization (not global training):
+  - Align: CPD registration parameters per source-target pair.
+  - Decompose: Tangram mapping/mixture optimization.
+
+## Practical Reading Takeaway
+- Pair supervision is mainly in OmiCLIP pretraining.
+- Most Loki downstream functions are embedding-space operations: registration, matching, decomposition, retrieval, and weighted prediction.

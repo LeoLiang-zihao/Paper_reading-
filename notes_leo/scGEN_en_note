@@ -1,0 +1,554 @@
+# scGEN: Deep Interpretation and Code Practice Guide
+
+**Date:** January 31, 2026
+
+---
+
+## 1. Introduction
+
+With the maturity of single-cell transcriptomics technology, we can now parse complex biological systems at unprecedented resolution. However, a core challenge remains: how to accurately predict cellular responses to external perturbations (such as drug treatments, gene editing, or disease influences). Traditional statistical or mechanistic models often struggle to generalize beyond training data, i.e., perform "out-of-sample" predictions [1].
+
+To address this challenge, Mohammad Lotfollahi, F. Alexander Wolf, and Fabian J. Theis published the deep learning model **scGen** in *Nature Methods* in 2019 [1]. The core idea of scGen is to cleverly combine **Variational Autoencoder (VAE)** with **Latent Space Vector Arithmetics**. It aims to learn a low-dimensional latent space that captures the intrinsic structure of cell gene expression data, and in this space, simplify complex biological perturbation effects into an operable linear vector.
+
+The uniqueness of this model lies in its strong generalization ability. scGen can not only accurately predict responses of unseen cell types to perturbations during training but also achieve predictions across studies and species. For example, applying a drug stimulation effect learned from one experiment to completely independent experimental data from another study, or using knowledge learned from multiple mammals to predict cellular responses in a new species. This makes scGen not just a prediction tool but potentially an "in silico screening" platform for efficiently screening potential drug targets or treatments before experimental design.
+
+This article deeply analyzes scGen's model architecture, core components, loss function design, data processing workflow, and combines its original paper and code repository to provide a detailed guide suitable for group meeting reports and subsequent in-depth learning.
+
+## 2. Problem Setting: What Does scGen Solve?
+
+Before diving into technical details, let's clarify the core problem scGen addresses.
+
+**Scenario**: You have single-cell data with multiple cell types (B cells, T cells, monocytes, etc.), each with "control" and "stimulation" states.
+
+**Problem**: Now a new cell type arrives, and you **only have its control state**. Predict what it looks like after stimulation.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                        Problem Setting Illustration                  │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│   Existing Training Data:                                            │
+│   ┌─────────────────┬─────────────┬─────────────┐                    │
+│   │   Cell Type     │   Control   │ Stimulation │                    │
+│   ├─────────────────┼─────────────┼─────────────┤                    │
+│   │   B cells       │     ✓       │     ✓       │                    │
+│   │   CD4-T         │     ✓       │     ✓       │                    │
+│   │   Monocytes     │     ✓       │     ✓       │                    │
+│   │   DC cells      │     ✓       │     ✓       │                    │
+│   └─────────────────┴─────────────┴─────────────┘                    │
+│                                                                      │
+│   To Predict:                                                        │
+│   ┌─────────────────┬─────────────┬─────────────┐                    │
+│   │   CD8-T         │     ✓       │     ?       │  ◄── Predict this!  │
+│   └─────────────────┴─────────────┴─────────────┘                    │
+│                                                                      │
+│   This is "out-of-sample prediction"                                 │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Core Idea**: scGen's assumption is that in the latent space learned by VAE, the "stimulation effect" can be represented by a vector δ. This is similar to the famous word2vec example in NLP:
+
+```
+Word2Vec:   King - Man + Woman ≈ Queen
+
+scGen:      z_control + δ_stimulation ≈ z_stimulated
+```
+
+## 3. Technical Origins: From VAE to scGen
+
+The theoretical foundation of scGen is the Variational Autoencoder (VAE), a deep generative model proposed by Diederik P. Kingma and Max Welling in 2013 [2]. Understanding VAE's evolution is crucial for grasping scGen's innovation.
+
+> **Variational Autoencoder (VAE)** is an unsupervised generative model that maps input data to a probability distribution (rather than a deterministic point) via an encoder, samples a latent vector from this distribution, and reconstructs the original data via a decoder. Its training objective is to maximize the evidence lower bound (ELBO) of the data's marginal log-likelihood, consisting of "reconstruction loss" and "KL divergence".
+
+Before scGen, VAE ideas had been applied to single-cell domains, e.g., scVAE [3] for raw count data clustering. Meanwhile, Google, DeepMind, etc., advanced VAE with variants like **Conditional VAE (CVAE)** and **β-VAE** [4], focusing on conditional generation and disentangled representations.
+
+scGen's core innovation is actively performing vector operations in the VAE-built latent space to simulate and predict biological processes, solving "out-of-sample prediction" that previous models struggled with.
+
+```
+                         VAE Evolution and scGen Relationship
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│    ┌─────────────────┐                                                  │
+│    │ Original VAE    │                                                  │
+│    │ (Kingma, 2013)  │                                                  │
+│    │ ───────────────  │                                                  │
+│    │ • Reparam Trick │                                                  │
+│    │ • ELBO Opt      │                                                  │
+│    └────────┬────────┘                                                  │
+│             │                                                           │
+│    ┌────────┴────────────────────────────────┐                          │
+│    │                                         │                          │
+│    ▼                                         ▼                          │
+│ ┌──────────────┐                    ┌──────────────┐                    │
+│ │    CVAE      │                    │   β-VAE      │                    │
+│ │ ──────────── │                    │ ──────────── │                    │
+│ │ Conditional  │                    │ Disentangled │                    │
+│ │ Generation   │                    │ Learning     │                    │
+│ │ Extra Cond   │                    │ KL Weight    │                    │
+│ └──────┬───────┘                    └──────┬───────┘                    │
+│        │                                   │                            │
+│        └───────────────┬───────────────────┘                            │
+│                        │                                                │
+│                        ▼                                                │
+│              ┌─────────────────────┐                                    │
+│              │      scGen         │                                    │
+│              │ (Lotfollahi, 2019) │                                    │
+│              │ ═══════════════════ │                                    │
+│              │ ★ Latent Vector    │  ◄─── Core Innovation             │
+│              │    Arithmetics     │                                    │
+│              │ • Perturb Predict  │                                    │
+│              │ • Cross-Type Gen   │                                    │
+│              │ • Batch Correction │                                    │
+│              └─────────────────────┘                                    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+*Figure 1: VAE evolution and scGen relationship. scGen inherits VAE framework, borrows from CVAE/β-VAE, innovates with "latent space vector arithmetics" for single-cell perturbation prediction.*
+
+Summary table of key changes from original VAE:
+
+| Feature | Original VAE (Kingma & Welling, 2013) | scGen (Lotfollahi et al., 2019) |
+|---------|--------------------------------------|---------------------------------|
+| **Main Goal** | Efficient probabilistic inference | Predict sc perturbation responses |
+| **Core Innovation** | Reparameterization Trick | Latent Space Arithmetics |
+| **Latent Space** | Passive data compression | **Active** operations for bio simulation |
+| **Applications** | Image gen, dim reduction | sc perturbation predict, batch correction |
+
+## 4. Model Architecture
+
+scGen's overall architecture is a standard VAE with encoder and decoder NNs, following `scvi-tools` practices for modularity [5].
+
+```
+                            scGen Model Overall Architecture
+┌──────────────────────────────────────────────────────────────────────────┐
+│                                                                          │
+│   Input x                     Latent Space                  Output x'    │
+│  (n_genes dim)                (100 dim)                    (n_genes dim) │
+│                                                                          │
+│  ┌─────────┐    ┌───────────────────────────────────┐    ┌─────────┐    │
+│  │         │    │           ENCODER                 │    │         │    │
+│  │  Gene   │    │  ┌─────┐   ┌─────┐   ┌────────┐  │    │  Recon  │    │
+│  │ Express │───►│  │FC   │──►│FC   │──►│ μ, σ²  │  │    │  Gene   │    │
+│  │  Vector │    │  │800  │   │800  │   │ Output │  │    │ Express │    │
+│  │         │    │  └─────┘   └─────┘   └────┬───┘  │    │         │    │
+│  └─────────┘    │                          │       │    └─────────┘    │
+│                 │                          ▼       │         ▲         │
+│                 │            ┌─────────────────┐   │         │         │
+│                 │            │ z = μ + σ * ε   │   │         │         │
+│                 │            │ (Reparam Trick) │   │         │         │
+│                 │            └────────┬────────┘   │         │         │
+│                 └────────────────────┼─────────────┘         │         │
+│                                      │                       │         │
+│                                      ▼                       │         │
+│                 ┌────────────────────────────────────────────┘         │
+│                 │            DECODER                                   │
+│                 │  ┌────────┐   ┌─────┐   ┌─────┐   ┌─────────┐       │
+│                 │  │ z      │──►│FC   │──►│FC   │──►│ x'      │       │
+│                 │  │ (100)  │   │800  │   │800  │   │(n_genes)│       │
+│                 │  └────────┘   └─────┘   └─────┘   └─────────┘       │
+│                 └─────────────────────────────────────────────────────┘│
+│                                                                          │
+│   Note: FC = Fully Connected + LeakyReLU + Dropout(0.2)                  │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+*Figure 2: scGen model architecture. Data compressed via encoder to latent prob dist, sampled, reconstructed via decoder.*
+
+### 4.1. Code: Network Definition (from _scgenvae.py)
+
+```python
+# File: scgen/_scgenvae.py
+
+class SCGENVAE(BaseModuleClass):
+    def __init__(
+        self,
+        n_input: int,           # Input dim = n_genes
+        n_hidden: int = 800,    # Hidden nodes
+        n_latent: int = 10,     # Latent dim (use 100 in practice)
+        n_layers: int = 2,      # Hidden layers
+        dropout_rate: float = 0.1,
+        kl_weight: float = 0.00005,  # KL weight
+    ):
+        # Encoder: n_genes → μ, σ² (n_latent dim)
+        self.z_encoder = Encoder(
+            n_input,           # Input
+            n_latent,          # Output = 100
+            n_layers=2,
+            n_hidden=800,
+            dropout_rate=0.1,
+            activation_fn=torch.nn.LeakyReLU,
+        )
+        
+        # Decoder: n_latent → n_genes
+        self.decoder = DecoderSCGEN(
+            n_latent,          # Input = 100
+            n_input,           # Output = n_genes
+            n_layers=2,
+            n_hidden=800,
+        )
+```
+
+### 4.2. Encoder
+Compresses high-dim sparse sc gene expression x (n_genes) to low-dim structured latent. Outputs Gaussian params μ(x), σ²(x).
+
+- Input: n_genes vector.
+- Hidden: 2 FC(800 + LeakyReLU + Dropout 0.2).
+- Output: μ and log(σ²), both 100-dim.
+
+### 4.3. Decoder
+Inverse: z(100) → x'(n_genes).
+
+- Symmetric to encoder: 2 FC(800, LeakyReLU, Dropout).
+- Output: reconstructed expression.
+
+### 4.4. Core: Latent Space & Reparam Trick
+Encoder → N(μ, σ²); sample via z = μ + σ * ε (ε~N(0,I)) for differentiability.
+
+## 5. Loss Function
+
+scGen (VAE) minimizes -ELBO: recon + KL [1,5].
+
+```
+                         scGen Loss Composition
+┌──────────────────────────────────────────────────────────────────────┐
+│                                                                      │
+│                       L_total = 0.5×L_recon + 0.5×(L_KL × kl_weight)│
+│                                                                      │
+│    ┌─────────────────────────────┐   ┌─────────────────────────────┐│
+│    │     Reconstruction Loss     │   │        KL Divergence        ││
+│    │        (L_recon)            │   │         (L_KL)              ││
+│    │     ═══════════════════     │   │     ═══════════════         ││
+│    │                             │   │                             ││
+│    │     L_recon = Σ(x - x')²    │   │  L_KL = KL[q(z|x) || p(z)]  ││
+│    │                             │   │                             ││
+│    │  ┌─────────────────────┐    │   │  ┌─────────────────────┐    ││
+│    │  │ Role:               │    │   │  │ Role:               │    ││
+│    │  │ Ensure accurate     │    │   │  │ Constrain latent    │    ││
+│    │  │ reconstruction      │    │   │  │ space structure     │    ││
+│    │  └─────────────────────┘    │   │  └─────────────────────┘    ││
+│    │                             │   │                             ││
+│    │  ┌─────────────────────┐    │   │  ┌─────────────────────┐    ││
+│    │  │ Issue:              │    │   │  │ Issue:              │    ││
+│    │  │ Too high → loss info│    │   │  │ Too high → collapse │    ││
+│    │  └─────────────────────┘    │   │  └─────────────────────┘    ││
+│    │                             │   │                             ││
+│    └─────────────────────────────┘   └─────────────────────────────┘│
+│                                                                      │
+│    ┌────────────────────────────────────────────────────────────────┐│
+│    │  kl_weight = 0.00005 (default)                                 ││
+│    │  Balances "reconstruction accuracy" vs "latent regularity"     ││
+│    └────────────────────────────────────────────────────────────────┘│
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+*Figure 3: scGen loss components and roles.*
+
+### 5.1. Reconstruction Loss
+MSE: L_recon = Σ(x - x')². Ensures info preservation.
+
+### 5.2. KL Divergence
+L_KL = KL[q(z|x) || p(z)] = -0.5 * Σ(1 + log(σ²) - μ² - σ²). Regularizes latent to N(0,I) for smooth space.
+
+### 5.3. Total Loss
+L_total = 0.5 * L_recon + 0.5 * (L_KL * kl_weight). kl_weight balances (default 5e-5).
+
+### 5.4. Code: Loss Impl
+
+```python
+# File: scgen/_scgenvae.py
+
+def loss(self, tensors, inference_outputs, generative_outputs):
+    x = tensors[REGISTRY_KEYS.X_KEY]
+    qz_m = inference_outputs["qz_m"]  # μ
+    qz_v = inference_outputs["qz_v"]  # σ²
+    p = generative_outputs["px"]  # x'
+    
+    # KL: q(z|x) vs N(0,1)
+    kld = kl(
+        Normal(qz_m, torch.sqrt(qz_v)),
+        Normal(0, 1),
+    ).sum(dim=1)
+    
+    # Recon: MSE
+    rl = self.get_reconstruction_loss(p, x)
+    
+    # Total
+    loss = (0.5 * rl + 0.5 * (kld * self.kl_weight)).mean()
+    
+    return LossOutput(loss=loss, reconstruction_loss=rl, kl_local=kld)
+
+def get_reconstruction_loss(self, x, px) -> torch.Tensor:
+    """MSE"""
+    loss = ((x - px) ** 2).sum(dim=1)
+    return loss
+```
+
+## 6. Data Flow & Core Algorithm
+
+### 6.1. Data Preprocessing
+Relies on scanpy [1].
+
+```
+                     scGen Data Preprocessing & Model Flow
+┌──────────────────────────────────────────────────────────────────────────┐
+│                                                                          │
+│  ┌────────────┐                                                          │
+│  │ Raw Data   │  .h5ad / .csv / 10X                                      │
+│  │ (counts)   │  cells × genes matrix                                    │
+│  └─────┬──────┘                                                          │
+│        │                                                                 │
+│        ▼                                                                 │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │                Preprocessing (scanpy)                              │  │
+│  │  ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────────┐    │  │
+│  │  │ 1.Normalize│──►│2.log1p  │──►│3.HVG Sel│──►│ 4.Metadata    │    │  │
+│  │  │ total()   │   │ log(x+1)│   │ ~7000 gns│   │ labels_key    │    │  │
+│  │  │           │   │         │   │          │   │ batch_key     │    │  │
+│  │  └──────────┘   └──────────┘   └──────────┘   └──────────────┘    │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│        │                                                                 │
+│        ▼                                                                 │
+│  ┌────────────┐                                                          │
+│  │  AnnData   │  adata.X = expr matrix                                   │
+│  │   Object   │  adata.obs = cell metadata (cell_type, condition...)     │
+│  └─────┬──────┘                                                          │
+│        │                                                                 │
+│        ▼                                                                 │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │                      Model Training                                │  │
+│  │  ┌─────────┐    ┌─────────────┐    ┌─────────┐                     │  │
+│  │  │ Encoder │───►│ Latent z    │───►│ Decoder │                     │  │
+│  │  └─────────┘    │ + δ vector  │    └─────────┘                     │  │
+│  │                 └─────────────┘                                     │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│        │                                                                 │
+│        ▼                                                                 │
+│  ┌────────────┐                                                          │
+│  │ Prediction │  Perturbation response for unseen cell types            │
+│  └────────────┘                                                          │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+*Figure 4: Full data flow from raw to prediction.*
+
+1. Read: .h5ad/csv → AnnData (cells x genes).
+2. Normalize: sc.pp.normalize_total().
+3. Log: sc.pp.log1p().
+4. HVG: sc.pp.highly_variable_genes() (~7000 genes).
+
+adata.obs needs labels_key (cell_type), batch_key (condition).
+
+### 6.2. Core Algorithm: Latent Vector Ops
+Train/Predict phases [1].
+
+```
+                     scGen Latent Space Vector Ops Diagram
+┌──────────────────────────────────────────────────────────────────────────┐
+│                                                                          │
+│         Gene Expr Space (High-dim)             Latent Space (Low-dim)    │
+│                                                                          │
+│  ╔═══════════════════════════╗      ╔════════════════════════════════╗  │
+│  ║   Training: Learn δ       ║      ║                                ║  │
+│  ║                           ║      ║    ●──────────────►●           ║  │
+│  ║  Control ●  ●  ●          ║      ║  z_ctrl            z_pert      ║  │
+│  ║         │  │  │  Encode   ║      ║    │       δ        │          ║  │
+│  ║         ▼  ▼  ▼  ═══════► ║      ║    └───────────────►┘          ║  │
+│  ║  Perturb ○  ○  ○          ║      ║                                ║  │
+│  ║                           ║      ║  δ = avg(z_pert) - avg(z_ctrl) ║  │
+│  ╚═══════════════════════════╝      ╚════════════════════════════════╝  │
+│                                                                          │
+│  ═══════════════════════════════════════════════════════════════════════ │
+│                                                                          │
+│  ╔═══════════════════════════╗      ╔════════════════════════════════╗  │
+│  ║   Prediction: Apply δ     ║      ║                                ║  │
+│  ║                           ║      ║         Apply δ                ║  │
+│  ║  New Cell A ★ (Ctrl only) ║      ║    ★─────────────────►☆        ║  │
+│  ║           │     Encode    ║      ║  z_new_ctrl    +δ   z_pred     ║  │
+│  ║           ▼     ════════► ║      ║                                ║  │
+│  ║  Pred Result ☆  ◄════════ ║      ║  z_pred = z_new_ctrl + δ       ║  │
+│  ║           ▲     Decode    ║      ║                                ║  │
+│  ║           │               ║      ║         Decode                 ║  │
+│  ║         (x')              ║      ║    ☆ ═════════════►  x'        ║  │
+│  ╚═══════════════════════════╝      ╚════════════════════════════════╝  │
+│                                                                          │
+│  Legend: ● Train Ctrl    ○ Train Pert    ★ New Ctrl    ☆ Predicted     │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+*Figure 5: Core algorithm. Learn δ in train, apply to new cells.*
+
+**Training**:
+1. Train VAE on ctrl+pert cells.
+2. z_control = encoder(ctrl), z_perturbed = encoder(pert).
+3. δ = avg(z_perturbed) - avg(z_control).
+
+**Prediction**:
+1. New type ctrl → z_new_control.
+2. z_pred = z_new_control + δ.
+3. x' = decoder(z_pred).
+
+### 6.3. Code: predict() Core
+
+```python
+# File: scgen/_scgen.py
+
+def predict(self, ctrl_key, stim_key, celltype_to_predict, ...):
+    # 1. Get train ctrl/stim
+    ctrl_x = self.adata[self.adata.obs[condition_key] == ctrl_key]
+    stim_x = self.adata[self.adata.obs[condition_key] == stim_key]
+    
+    # 2. Balance cell types
+    ctrl_x = balancer(ctrl_x, cell_type_key)
+    stim_x = balancer(stim_x, cell_type_key)
+    
+    # 3. Sample equal sizes
+    eq = min(ctrl_x.X.shape[0], stim_x.X.shape[0])
+    ctrl_adata = ctrl_x[np.random.choice(range(ctrl_x.shape[0]), size=eq)]
+    stim_adata = stim_x[np.random.choice(range(stim_x.shape[0]), size=eq)]
+    
+    # 4. Avg latents
+    latent_ctrl = self._avg_vector(ctrl_adata)
+    latent_stim = self._avg_vector(stim_adata)
+    
+    # ★★★ Core: δ ★★★
+    delta = latent_stim - latent_ctrl
+    
+    # 5. New cell latent
+    latent_cd = self.get_latent_representation(ctrl_pred)
+    
+    # ★★★ Core: Apply δ ★★★
+    stim_pred = delta + latent_cd
+    
+    # 6. Decode
+    predicted_cells = self.module.generative(torch.Tensor(stim_pred))["px"]
+    
+    return predicted_adata, delta
+
+def _avg_vector(self, adata):
+    return np.mean(self.get_latent_representation(adata), axis=0)
+```
+
+**Notes**: δ (100-dim), simple add, non-linear decode.
+
+## 7. Training Details
+Via scvi-tools .train():
+- Optimizer: Adam.
+- Batch: 128.
+- LR: 1e-3.
+- Epochs: user-set (e.g., 100).
+- Auto data loader.
+
+## 8. Why Vector Ops Work?
+Paper (lines 78-83): Latent manifolds have "approximately **linear axes of variation**" for major data variability.
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                     Why Vector Ops Work?                               │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│   Raw Gene Space (High-dim, Nonlinear)                                 │
+│   ┌─────────────────────────────────┐                                  │
+│   │   ●                             │   Complex distrib                │
+│   │      ●    ●                     │   Nonlinear pert effects         │
+│   │         ○   ○                   │   Type-specific responses        │
+│   │   ●         ○                   │                                  │
+│   │      ○  ○                       │                                  │
+│   └─────────────────────────────────┘                                  │
+│           │                                                            │
+│           │ Nonlinear Encoder                                          │
+│           ▼                                                            │
+│   Latent Space (Low-dim, ~Linear)                                      │
+│   ┌─────────────────────────────────┐                                  │
+│   │   ●───────────────►○            │   Pert as simple vector shift!   │
+│   │       ●───────────────►○        │                                  │
+│   │   ●───────────────►○            │   δ approx same across types     │
+│   │                                 │                                  │
+│   │   ◄ ◄ ◄ ◄ δ ► ► ► ►            │                                  │
+│   └─────────────────────────────────┘                                  │
+│           │                                                            │
+│           │ Nonlinear Decoder                                          │
+│           ▼                                                            │
+│   Predicted (High-dim, Captures Nonlinearity)                          │
+│   ┌─────────────────────────────────┐                                  │
+│   │   Linear δ + Nonlinear Decoder  │                                  │
+│   │   → Type-specific complex resp  │                                  │
+│   └─────────────────────────────────┘                                  │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**Insights**:
+1. Encoder: Nonlinear → simple manifold.
+2. Latent: Linear directions for bio vars.
+3. Decoder: Linear pred → nonlinear output.
+
+## 9. Full Usage Example
+
+```python
+import scanpy as sc
+import scgen
+
+# 1. Load & Preprocess (Kang PBMC example)
+adata = sc.read("pbmc_data.h5ad")
+
+sc.pp.normalize_total(adata)
+sc.pp.log1p(adata)
+sc.pp.highly_variable_genes(adata, n_top_genes=7000)
+adata = adata[:, adata.var.highly_variable]
+
+# 2. Setup
+scgen.SCGEN.setup_anndata(adata, batch_key="condition", labels_key="cell_type")
+
+# 3. Model & Train
+model = scgen.SCGEN(adata, n_hidden=800, n_latent=100, n_layers=2, dropout_rate=0.2)
+model.train(max_epochs=100)
+
+# 4. Predict CD8-T stim
+pred_adata, delta = model.predict("control", "stimulated", "CD8-T")
+
+print(f"Pred cells: {pred_adata.shape[0]}")
+print(f"δ dim: {delta.shape}")
+
+# 5. Viz
+model.reg_mean_plot(adata=all_adata, axis_keys={"x": "control", "y": "predicted", "y1": "stimulated"}, gene_list=["ISG15", "IFI6", "IFIT1"], path_to_save="prediction_result.pdf")
+```
+
+**Output**: pred_adata.X = predicted expr; delta = pert vector.
+
+## 10. Paper Results Interpretation
+
+- **Out-of-sample accuracy (Fig2)**: Leave-one-type-out; pred vs real R²>0.95, beats CVAE/GAN.
+- **Type-specific capture (Fig2g)**: Shared δ + nonlinear decoder → type-specific changes (e.g., genes only in DC).
+
+## 11. Summary: What Problems Does scGen Solve?
+
+Key advances:
+1. **Generalizable out-of-sample prediction**: Extrapolates to unseen conditions.
+2. **Stable, interpretable generative model**: Easier than GANs; δ quantifiable.
+3. **Unified perturb predict + batch correction**.
+
+**One-sentence summary**: scGen turns complex nonlinear perturbation effects into simple latent vector addition via VAE.
+
+### Quick Reference Table
+
+| Step | Action | Why | Code |
+|------|--------|-----|------|
+| 1. Train VAE | Compress expr to 100D latent | Makes pert ~linear | _scgenvae.py |
+| 2. Compute δ | avg(z_stim) - avg(z_ctrl) | Avg pert shift | _scgen.py:158 |
+| 3. Apply δ | z_new_ctrl + δ | Linear extrapolate | _scgen.py:162 |
+| 4. Decode | Decoder(z_pred) | Nonlinear type-specific resp | _scgen.py:164 |
+
+---
+
+## References
+
+[1] Lotfollahi, M., et al. (2019). scGen predicts single-cell perturbation responses. *Nature Methods*. [link](https://www.nature.com/articles/s41592-019-0494-8)
+
+[2] Kingma, D. P., & Welling, M. (2013). Auto-Encoding Variational Bayes. [link](https://arxiv.org/abs/1312.6114)
+
+[3] Grønbech, C. H., et al. (2018). scVAE. [link](https://www.biorxiv.org/content/10.1101/318295v1)
+
+[4] Higgins, I., et al. (2017). β-VAE.
+
+[5] scGen GitHub. [link](https://github.com/theislab/scgen)
